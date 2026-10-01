@@ -129,7 +129,7 @@ class ServiceAppFactory(BaseAppFactory):
                 continue
             configured_latency = method.max_latency_ms
             dispatcher_latency = (
-                configured_latency
+                t.cast(int, configured_latency)
                 if type(configured_latency) is int
                 else DEFAULT_MAX_LATENCY_MS
             )
