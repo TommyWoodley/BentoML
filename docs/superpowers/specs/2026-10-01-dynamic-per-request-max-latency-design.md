@@ -149,11 +149,11 @@ The public type is conceptually:
 
 ```python
 from collections.abc import Callable
-from typing import TypeAlias
+from typing import TypeAlias, Union
 
 from starlette.requests import Request
 
-MaxLatency: TypeAlias = int | Callable[[Request], int]
+MaxLatency: TypeAlias = Union[int, Callable[[Request], int]]
 ```
 
 Starlette's `Request` is the narrowest honest type for the first implementation. BentoML's current new-style service request context is also backed by a Starlette request, so introducing a new wrapper would not provide transport independence today.
