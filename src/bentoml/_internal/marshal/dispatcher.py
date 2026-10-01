@@ -109,6 +109,15 @@ class Job(t.Generic[T_IN, T_OUT]):
     dispatch_time: float = 0
 
 
+@attr.frozen
+class CandidateInfo:
+    job_count: int
+    sample_size: int
+    first_enqueue_time: float
+    last_enqueue_time: float
+    earliest_deadline: float
+
+
 class CorkDispatcher(t.Generic[T_IN, T_OUT]):
     """
     A decorator that:
@@ -153,11 +162,104 @@ class CorkDispatcher(t.Generic[T_IN, T_OUT]):
         self._queue: collections.deque[Job[T_IN, T_OUT]] = (
             collections.deque()
         )  # TODO(bojiang): maxlen
+        self._queue_revision = 0
+        self._candidate_cache: tuple[int, CandidateInfo] | None = None
+        self._next_expiry: float | None = None
         self.get_batch_size = get_batch_size
         self.batch_dim = batch_dim
         self._clock = clock
         # at most 1 batch can be processed at the same time
         self._sema = shared_sema if shared_sema else NonBlockSema(1)
+
+    def _invalidate_queue_state(self, *, recompute_expiry: bool) -> None:
+        self._queue_revision += 1
+        self._candidate_cache = None
+        if recompute_expiry:
+            self._next_expiry = min((job.deadline for job in self._queue), default=None)
+
+    def _append_job(self, job: Job[T_IN, T_OUT]) -> None:
+        self._queue.append(job)
+        self._invalidate_queue_state(recompute_expiry=False)
+        if self._next_expiry is None or job.deadline < self._next_expiry:
+            self._next_expiry = job.deadline
+
+    def _get_batch_size(self, data: T_IN) -> int:
+        try:
+            return self.get_batch_size(data)
+        except Exception:
+            logger.exception(
+                "error in batch-size aware batching, falling back to regular batching method"
+            )
+            return 1
+
+    def _peek_candidate(self, num_batches: int | None = None) -> CandidateInfo | None:
+        use_cache = num_batches is None
+        if use_cache and self._candidate_cache is not None:
+            revision, candidate = self._candidate_cache
+            if revision == self._queue_revision:
+                return candidate
+
+        limit = self.max_batch_size if num_batches is None else num_batches
+        sample_size = 0
+        job_count = 0
+        first_enqueue_time = 0.0
+        last_enqueue_time = 0.0
+        earliest_deadline = float("inf")
+
+        for job in self._queue:
+            remaining = limit - sample_size
+            if remaining <= 0:
+                break
+            batch_size = self._get_batch_size(job.data)
+            if job_count == 0:
+                first_enqueue_time = job.enqueue_time
+            job_count += 1
+            sample_size += min(batch_size, remaining)
+            last_enqueue_time = job.enqueue_time
+            earliest_deadline = min(earliest_deadline, job.deadline)
+            if batch_size >= remaining:
+                break
+
+        if job_count == 0:
+            return None
+
+        candidate = CandidateInfo(
+            job_count=job_count,
+            sample_size=sample_size,
+            first_enqueue_time=first_enqueue_time,
+            last_enqueue_time=last_enqueue_time,
+            earliest_deadline=earliest_deadline,
+        )
+        if use_cache:
+            self._candidate_cache = (self._queue_revision, candidate)
+        return candidate
+
+    def _expire_jobs(self, now: float) -> int:
+        if self._next_expiry is None or now < self._next_expiry:
+            return 0
+
+        surviving: collections.deque[Job[T_IN, T_OUT]] = collections.deque()
+        expired: list[Job[T_IN, T_OUT]] = []
+        for job in self._queue:
+            if job.deadline <= now:
+                expired.append(job)
+            else:
+                surviving.append(job)
+
+        self._queue = surviving
+        self._invalidate_queue_state(recompute_expiry=True)
+        for job in expired:
+            if not job.future.done():
+                job.future.cancel()
+        return len(expired)
+
+    def _take_inputs(
+        self, num_batches: int | None = None
+    ) -> tuple[Job[T_IN, T_OUT], ...]:
+        inputs = tuple(self._get_inputs(num_batches))
+        if inputs:
+            self._invalidate_queue_state(recompute_expiry=True)
+        return inputs
 
     def shutdown(self) -> None:
         if self._controller is not None:
@@ -248,7 +350,7 @@ class CorkDispatcher(t.Generic[T_IN, T_OUT]):
                 req_count += 1
                 # call
                 self._sema.acquire()
-                inputs_info = tuple(self._get_inputs())
+                inputs_info = self._take_inputs()
                 self._loop.create_task(self.outbound_call(inputs_info, training=True))
         except Exception:
             logger.exception("Error in training optimizer")
@@ -322,7 +424,7 @@ class CorkDispatcher(t.Generic[T_IN, T_OUT]):
                     continue
                 # call
                 self._sema.acquire()
-                inputs_info = tuple(self._get_inputs())
+                inputs_info = self._take_inputs()
                 self._loop.create_task(self.outbound_call(inputs_info))
             except Exception:
                 logger.exception("Error processing batch requests")
@@ -341,7 +443,7 @@ class CorkDispatcher(t.Generic[T_IN, T_OUT]):
             future=future,
             deadline=now + latency,
         )
-        self._queue.append(input_info)
+        self._append_job(input_info)
         async with self._wake_event:
             self._wake_event.notify_all()
         return await future
@@ -390,13 +492,7 @@ class CorkDispatcher(t.Generic[T_IN, T_OUT]):
             num_batches = self.max_batch_size
         batch_size = 0
         while len(self._queue) > 0 and batch_size < num_batches:
-            try:
-                next_batch_size = self.get_batch_size(self._queue[0].data)
-            except Exception:
-                logger.exception(
-                    "error in batch-size aware batching, falling back to regular batching method",
-                )
-                next_batch_size = 1
+            next_batch_size = self._get_batch_size(self._queue[0].data)
             if batch_size + next_batch_size <= num_batches:
                 batch_size += next_batch_size
                 yield self._queue.popleft()

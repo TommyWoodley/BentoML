@@ -117,3 +117,102 @@ async def test_split_job_preserves_deadline() -> None:
 
     assert first.deadline == job.deadline
     assert second.deadline == job.deadline
+
+
+def queued_job(
+    dispatcher: CorkDispatcher[t.Any, t.Any],
+    *,
+    data: tuple[str, int],
+    enqueue_time: float,
+    deadline: float,
+) -> Job[t.Any, t.Any]:
+    future: asyncio.Future[t.Any | Exception] = dispatcher._loop.create_future()
+    return Job(
+        enqueue_time=enqueue_time,
+        data=data,
+        future=future,
+        deadline=deadline,
+    )
+
+
+def test_peek_candidate_matches_batch_size_without_mutating_queue() -> None:
+    clock = FakeClock()
+    dispatcher = make_dispatcher(
+        clock,
+        max_batch_size=10,
+        get_batch_size=lambda data: data[1],
+    )
+    jobs = [
+        queued_job(dispatcher, data=("A", 7), enqueue_time=90, deadline=200),
+        queued_job(dispatcher, data=("B", 7), enqueue_time=91, deadline=120),
+        queued_job(dispatcher, data=("C", 6), enqueue_time=92, deadline=105),
+    ]
+    for job in jobs:
+        dispatcher._append_job(job)
+
+    candidate = dispatcher._peek_candidate()
+
+    assert candidate is not None
+    assert candidate.job_count == 2
+    assert candidate.sample_size == 10
+    assert candidate.earliest_deadline == 120
+    assert candidate.last_enqueue_time == 91
+    assert list(dispatcher._queue) == jobs
+
+
+def test_candidate_cache_is_invalidated_by_tighter_enqueue() -> None:
+    clock = FakeClock()
+    dispatcher = make_dispatcher(clock, max_batch_size=4)
+    dispatcher._append_job(
+        queued_job(dispatcher, data=("A", 1), enqueue_time=90, deadline=200)
+    )
+    first = dispatcher._peek_candidate()
+    dispatcher._append_job(
+        queued_job(dispatcher, data=("B", 1), enqueue_time=91, deadline=110)
+    )
+    second = dispatcher._peek_candidate()
+
+    assert first is not None
+    assert second is not None
+    assert first.earliest_deadline == 200
+    assert second.earliest_deadline == 110
+
+
+def test_deadline_outside_candidate_does_not_change_candidate_deadline() -> None:
+    clock = FakeClock()
+    dispatcher = make_dispatcher(clock, max_batch_size=2)
+    for name, deadline in [("A", 200), ("B", 210), ("C", 105)]:
+        dispatcher._append_job(
+            queued_job(
+                dispatcher,
+                data=(name, 1),
+                enqueue_time=90,
+                deadline=deadline,
+            )
+        )
+
+    candidate = dispatcher._peek_candidate()
+
+    assert candidate is not None
+    assert candidate.job_count == 2
+    assert candidate.earliest_deadline == 200
+    assert dispatcher._next_expiry == 105
+
+
+def test_expire_jobs_removes_only_expired_jobs_and_preserves_fifo() -> None:
+    clock = FakeClock(110)
+    dispatcher = make_dispatcher(clock, max_batch_size=2)
+    jobs = [
+        queued_job(dispatcher, data=("A", 1), enqueue_time=90, deadline=200),
+        queued_job(dispatcher, data=("B", 1), enqueue_time=91, deadline=105),
+        queued_job(dispatcher, data=("C", 1), enqueue_time=92, deadline=210),
+    ]
+    for job in jobs:
+        dispatcher._append_job(job)
+
+    assert dispatcher._expire_jobs(clock()) == 1
+    assert [job.data[0] for job in dispatcher._queue] == ["A", "C"]
+    assert jobs[1].future.cancelled()
+    assert not jobs[0].future.done()
+    assert not jobs[2].future.done()
+    assert dispatcher._next_expiry == 200
