@@ -55,7 +55,9 @@ def test_dynamic_latency_survives_build_and_shares_batches(examples: Path) -> No
                     executor.submit(post_prediction, server.url, value, latency)
                     for value, latency in zip(values, latencies)
                 ]
-                assert sorted(future.result()[0] for future in futures) == values
+                assert [future.result() for future in futures] == [
+                    [value] for value in values
+                ]
 
             stats = client.stats()
             assert sorted(stats["latencies"]) == sorted(latencies)
