@@ -119,6 +119,38 @@ class CandidateInfo:
     earliest_deadline: float
 
 
+@attr.frozen
+class ScheduleDecision:
+    dispatch: bool
+    wait_time: float
+
+
+def decide_next_action(
+    *,
+    now: float,
+    candidate: CandidateInfo,
+    predicted_duration: float,
+    adaptive_should_wait: bool,
+    semaphore_locked: bool,
+    next_expiry: float | None,
+    ticket_interval: float,
+) -> ScheduleDecision:
+    if semaphore_locked:
+        wake_at = now + ticket_interval
+        if next_expiry is not None:
+            wake_at = min(wake_at, next_expiry)
+        return ScheduleDecision(False, max(0.0, wake_at - now))
+
+    latest_safe_start = candidate.earliest_deadline - predicted_duration
+    if now >= latest_safe_start or not adaptive_should_wait:
+        return ScheduleDecision(True, 0.0)
+
+    wake_at = min(now + ticket_interval, latest_safe_start)
+    if next_expiry is not None:
+        wake_at = min(wake_at, next_expiry)
+    return ScheduleDecision(False, max(0.0, wake_at - now))
+
+
 class CorkDispatcher(t.Generic[T_IN, T_OUT]):
     """
     A decorator that:
@@ -215,13 +247,6 @@ class CorkDispatcher(t.Generic[T_IN, T_OUT]):
         self._queue.append(job)
         self._invalidate_queue_state(recompute_expiry=False)
         self._track_queued_job(job)
-
-    def _popleft_job(self) -> Job[T_IN, T_OUT]:
-        job = self._queue.popleft()
-        self._untrack_queued_job(job)
-        self._invalidate_queue_state(recompute_expiry=False)
-        self._refresh_next_expiry()
-        return job
 
     def _get_batch_size(self, data: T_IN) -> int:
         try:
@@ -343,55 +368,49 @@ class CorkDispatcher(t.Generic[T_IN, T_OUT]):
 
     async def train_optimizer(
         self,
-        num_required_reqs: int,
         num_reqs_to_train: int,
         training_batch_size: int,
-    ):
-        if self.max_batch_size < training_batch_size:
-            training_batch_size = self.max_batch_size
-
-        wait = 0.0
-        if training_batch_size > 1:
-            wait = min(
-                self.max_latency * 0.95,
-                # wait for at most approximated time to process 2n + 1 requests
-                (training_batch_size * 2 + 1) * self.optimizer.o_a + self.optimizer.o_b,
-            )
-
+    ) -> None:
+        target_job_count = min(self.max_batch_size, training_batch_size)
         req_count = 0
         try:
             while req_count < num_reqs_to_train:
-                async with self._wake_event:  # block until there's any request in queue
+                async with self._wake_event:
                     await self._wake_event.wait_for(self._queue.__len__)
 
-                n = len(self._queue)
                 now = self._clock()
-                # the wait time of the first request
-                w0 = now - self._queue[0].enqueue_time
-
-                # only cancel requests if there are more than enough for training
-                if n > num_required_reqs - req_count and w0 >= self.max_latency:
-                    # we're being very conservative and only canceling requests if they have already timed out
-                    self._popleft_job().future.cancel()
-                    continue
-                if training_batch_size > 1:  # only wait if batch_size
-                    a = self.optimizer.o_a
-                    b = self.optimizer.o_b
-
-                    if (
-                        n < training_batch_size
-                        and (training_batch_size * a + b) + w0 <= wait
-                    ):
-                        await asyncio.sleep(self.TICKET_INTERVAL)
-                        continue
-                if self._sema.is_locked():
-                    await asyncio.sleep(self.TICKET_INTERVAL)
+                self._expire_jobs(now)
+                if not self._queue:
                     continue
 
-                req_count += 1
-                # call
-                self._sema.acquire()
+                candidate = self._peek_candidate()
+                assert candidate is not None
+                a = self.optimizer.o_a
+                b = self.optimizer.o_b
+                predicted_duration = a * candidate.job_count + b
+                oldest_wait = now - candidate.first_enqueue_time
+                training_wait = (target_job_count * 2 + 1) * a + b
+                adaptive_should_wait = (
+                    candidate.job_count < target_job_count
+                    and (target_job_count * a + b) + oldest_wait <= training_wait
+                )
+                decision = decide_next_action(
+                    now=now,
+                    candidate=candidate,
+                    predicted_duration=predicted_duration,
+                    adaptive_should_wait=adaptive_should_wait,
+                    semaphore_locked=self._sema.is_locked(),
+                    next_expiry=self._next_expiry,
+                    ticket_interval=self.TICKET_INTERVAL,
+                )
+                if not decision.dispatch:
+                    await asyncio.sleep(decision.wait_time)
+                    continue
+
+                acquired = self._sema.acquire()
+                assert acquired
                 inputs_info = self._take_inputs()
+                req_count += 1
                 self._loop.create_task(self.outbound_call(inputs_info, training=True))
         except Exception:
             logger.exception("Error in training optimizer")
@@ -403,21 +422,19 @@ class CorkDispatcher(t.Generic[T_IN, T_OUT]):
         try:
             logger.debug("Starting dispatcher optimizer training...")
             # warm up the model
-            await self.train_optimizer(
-                self.optimizer.N_SKIPPED_SAMPLE, self.optimizer.N_SKIPPED_SAMPLE + 6, 1
-            )
+            await self.train_optimizer(self.optimizer.N_SKIPPED_SAMPLE + 6, 1)
 
             logger.debug("Dispatcher finished warming up model.")
 
-            await self.train_optimizer(6, 1, 1)
+            await self.train_optimizer(1, 1)
             self.optimizer.trigger_refresh()
             logger.debug("Dispatcher finished optimizer training request 1.")
 
-            await self.train_optimizer(5, 1, 2)
+            await self.train_optimizer(1, 2)
             self.optimizer.trigger_refresh()
             logger.debug("Dispatcher finished optimizer training request 2.")
 
-            await self.train_optimizer(3, 1, 3)
+            await self.train_optimizer(1, 3)
             self.optimizer.trigger_refresh()
             logger.debug("Dispatcher finished optimizer training request 3.")
 
@@ -431,40 +448,41 @@ class CorkDispatcher(t.Generic[T_IN, T_OUT]):
 
         while True:
             try:
-                async with self._wake_event:  # block until there's any request in queue
+                async with self._wake_event:
                     await self._wake_event.wait_for(self._queue.__len__)
 
-                n = len(self._queue)
-                dt = self.TICKET_INTERVAL
-                decay = 0.95  # the decay rate of wait time
                 now = self._clock()
-                # the wait time of the first request
-                w0 = now - self._queue[0].enqueue_time
-                # the wait time of the last request
-                wn = now - self._queue[-1].enqueue_time
+                self._expire_jobs(now)
+                if not self._queue:
+                    continue
+
+                candidate = self._peek_candidate()
+                assert candidate is not None
                 a = self.optimizer.o_a
                 b = self.optimizer.o_b
+                predicted_duration = a * candidate.job_count + b
+                newest_wait = now - candidate.last_enqueue_time
+                adaptive_should_wait = (
+                    candidate.sample_size < self.max_batch_size
+                    and candidate.job_count
+                    * (newest_wait + self.TICKET_INTERVAL + (a or 0))
+                    <= self.optimizer.wait * 0.95
+                )
+                decision = decide_next_action(
+                    now=now,
+                    candidate=candidate,
+                    predicted_duration=predicted_duration,
+                    adaptive_should_wait=adaptive_should_wait,
+                    semaphore_locked=self._sema.is_locked(),
+                    next_expiry=self._next_expiry,
+                    ticket_interval=self.TICKET_INTERVAL,
+                )
+                if not decision.dispatch:
+                    await asyncio.sleep(decision.wait_time)
+                    continue
 
-                # the estimated latency of the first request if we began processing now
-                latency_0 = w0 + a * n + b
-
-                if n > 1 and latency_0 >= self.max_latency:
-                    self._popleft_job().future.cancel()
-                    continue
-                if self._sema.is_locked():
-                    if n == 1 and w0 >= self.max_latency:
-                        self._popleft_job().future.cancel()
-                        continue
-                    await asyncio.sleep(self.TICKET_INTERVAL)
-                    continue
-                if (
-                    n < self.max_batch_size
-                    and n * (wn + dt + (a or 0)) <= self.optimizer.wait * decay
-                ):
-                    await asyncio.sleep(self.TICKET_INTERVAL)
-                    continue
-                # call
-                self._sema.acquire()
+                acquired = self._sema.acquire()
+                assert acquired
                 inputs_info = self._take_inputs()
                 self._loop.create_task(self.outbound_call(inputs_info))
             except Exception:

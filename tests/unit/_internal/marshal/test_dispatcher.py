@@ -6,8 +6,11 @@ import typing as t
 import numpy as np
 import pytest
 
+from bentoml._internal.marshal.dispatcher import CandidateInfo
 from bentoml._internal.marshal.dispatcher import CorkDispatcher
 from bentoml._internal.marshal.dispatcher import Job
+from bentoml._internal.marshal.dispatcher import ScheduleDecision
+from bentoml._internal.marshal.dispatcher import decide_next_action
 
 
 class FakeClock:
@@ -247,34 +250,6 @@ def test_take_inputs_does_not_scan_every_remaining_deadline() -> None:
     assert dispatcher._next_expiry == 201
 
 
-def test_popleft_job_updates_candidate_and_expiry_state() -> None:
-    clock = FakeClock()
-    dispatcher = make_dispatcher(clock, max_batch_size=2)
-    first = queued_job(
-        dispatcher,
-        data=("A", 1),
-        enqueue_time=90,
-        deadline=105,
-    )
-    second = queued_job(
-        dispatcher,
-        data=("B", 1),
-        enqueue_time=91,
-        deadline=120,
-    )
-    dispatcher._append_job(first)
-    dispatcher._append_job(second)
-    assert dispatcher._peek_candidate() is not None
-
-    assert dispatcher._popleft_job() is first
-
-    candidate = dispatcher._peek_candidate()
-    assert candidate is not None
-    assert candidate.job_count == 1
-    assert candidate.earliest_deadline == 120
-    assert dispatcher._next_expiry == 120
-
-
 def test_split_failure_preserves_queue_and_cached_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -308,3 +283,223 @@ def test_split_failure_preserves_queue_and_cached_state(
     assert dispatcher._queue_revision == revision
     assert dispatcher._peek_candidate() is candidate
     assert dispatcher._next_expiry == 105
+
+
+def candidate(deadline: float = 110.0) -> CandidateInfo:
+    return CandidateInfo(
+        job_count=2,
+        sample_size=2,
+        first_enqueue_time=100.0,
+        last_enqueue_time=101.0,
+        earliest_deadline=deadline,
+    )
+
+
+def test_decision_waits_when_optimizer_and_deadline_allow() -> None:
+    decision = decide_next_action(
+        now=105.0,
+        candidate=candidate(),
+        predicted_duration=2.0,
+        adaptive_should_wait=True,
+        semaphore_locked=False,
+        next_expiry=110.0,
+        ticket_interval=1.0,
+    )
+    assert decision == ScheduleDecision(dispatch=False, wait_time=1.0)
+
+
+def test_decision_caps_wait_at_latest_safe_start() -> None:
+    decision = decide_next_action(
+        now=107.5,
+        candidate=candidate(),
+        predicted_duration=2.0,
+        adaptive_should_wait=True,
+        semaphore_locked=False,
+        next_expiry=110.0,
+        ticket_interval=1.0,
+    )
+    assert decision == ScheduleDecision(dispatch=False, wait_time=0.5)
+
+
+def test_decision_dispatches_at_latest_safe_start() -> None:
+    decision = decide_next_action(
+        now=108.0,
+        candidate=candidate(),
+        predicted_duration=2.0,
+        adaptive_should_wait=True,
+        semaphore_locked=False,
+        next_expiry=110.0,
+        ticket_interval=1.0,
+    )
+    assert decision == ScheduleDecision(dispatch=True, wait_time=0.0)
+
+
+def test_impossible_deadline_dispatches_when_capacity_is_free() -> None:
+    decision = decide_next_action(
+        now=105.0,
+        candidate=candidate(deadline=106.0),
+        predicted_duration=2.0,
+        adaptive_should_wait=True,
+        semaphore_locked=False,
+        next_expiry=106.0,
+        ticket_interval=1.0,
+    )
+    assert decision.dispatch
+
+
+def test_locked_semaphore_waits_until_ticket_or_expiry() -> None:
+    decision = decide_next_action(
+        now=105.0,
+        candidate=candidate(deadline=106.0),
+        predicted_duration=2.0,
+        adaptive_should_wait=False,
+        semaphore_locked=True,
+        next_expiry=105.25,
+        ticket_interval=1.0,
+    )
+    assert decision == ScheduleDecision(dispatch=False, wait_time=0.25)
+
+
+def test_optimizer_can_release_before_deadline() -> None:
+    decision = decide_next_action(
+        now=105.0,
+        candidate=candidate(),
+        predicted_duration=2.0,
+        adaptive_should_wait=False,
+        semaphore_locked=False,
+        next_expiry=110.0,
+        ticket_interval=1.0,
+    )
+    assert decision.dispatch
+
+
+def test_late_tight_deadline_changes_release_without_reordering() -> None:
+    clock = FakeClock(105.0)
+    dispatcher = make_dispatcher(clock, max_batch_size=4)
+    for name, deadline in [("A", 200.0), ("B", 201.0)]:
+        dispatcher._append_job(
+            queued_job(
+                dispatcher,
+                data=(name, 1),
+                enqueue_time=100.0,
+                deadline=deadline,
+            )
+        )
+
+    before = dispatcher._peek_candidate()
+    assert before is not None
+    assert not decide_next_action(
+        now=clock(),
+        candidate=before,
+        predicted_duration=0.002,
+        adaptive_should_wait=True,
+        semaphore_locked=False,
+        next_expiry=dispatcher._next_expiry,
+        ticket_interval=0.001,
+    ).dispatch
+
+    dispatcher._append_job(
+        queued_job(
+            dispatcher,
+            data=("C", 1),
+            enqueue_time=105.0,
+            deadline=105.001,
+        )
+    )
+    after = dispatcher._peek_candidate()
+    assert after is not None
+    assert decide_next_action(
+        now=clock(),
+        candidate=after,
+        predicted_duration=0.002,
+        adaptive_should_wait=True,
+        semaphore_locked=False,
+        next_expiry=dispatcher._next_expiry,
+        ticket_interval=0.001,
+    ).dispatch
+    assert [job.data[0] for job in dispatcher._take_inputs()] == ["A", "B", "C"]
+
+
+@pytest.mark.asyncio
+async def test_expired_job_uses_existing_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = FakeClock()
+    dispatcher = make_dispatcher(clock, max_latency_in_ms=10)
+
+    async def fake_controller() -> None:
+        await asyncio.Future()
+
+    monkeypatch.setattr(dispatcher, "controller", fake_controller)
+
+    async def callback(values: t.Sequence[str]) -> t.Sequence[str]:
+        return values
+
+    wrapped = dispatcher(callback)
+    task = asyncio.create_task(wrapped("expires"))
+    await asyncio.sleep(0)
+    try:
+        clock.advance(0.011)
+        assert dispatcher._expire_jobs(clock()) == 1
+        assert await task == "fallback"
+    finally:
+        dispatcher.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_future_does_not_shift_other_results() -> None:
+    clock = FakeClock()
+    dispatcher = make_dispatcher(clock)
+    jobs = [
+        queued_job(
+            dispatcher,
+            data=(name, 1),
+            enqueue_time=100.0,
+            deadline=101.0,
+        )
+        for name in ("A", "B", "C")
+    ]
+    for job in jobs:
+        dispatcher._append_job(job)
+
+    async def callback(
+        values: t.Sequence[tuple[str, int]],
+    ) -> t.Sequence[tuple[str, int]]:
+        return [(f"{name}-result", size) for name, size in values]
+
+    dispatcher.callback = callback
+    assert dispatcher._sema.acquire()
+    inputs = dispatcher._take_inputs()
+    jobs[1].future.cancel()
+
+    await dispatcher.outbound_call(inputs)
+
+    assert jobs[0].future.result() == ("A-result", 1)
+    assert jobs[1].future.cancelled()
+    assert jobs[2].future.result() == ("C-result", 1)
+
+
+@pytest.mark.asyncio
+async def test_static_wrapper_keeps_constructor_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = FakeClock()
+    dispatcher = make_dispatcher(clock, max_latency_in_ms=40)
+
+    async def fake_controller() -> None:
+        await asyncio.Future()
+
+    monkeypatch.setattr(dispatcher, "controller", fake_controller)
+
+    async def callback(values: t.Sequence[str]) -> t.Sequence[str]:
+        return values
+
+    wrapped = dispatcher(callback)
+    task = asyncio.create_task(wrapped("legacy"))
+    await asyncio.sleep(0)
+    try:
+        assert dispatcher._queue[0].deadline == pytest.approx(100.04)
+        dispatcher._queue[0].future.set_result("legacy")
+        assert await task == "legacy"
+    finally:
+        dispatcher.shutdown()
