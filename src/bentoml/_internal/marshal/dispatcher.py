@@ -105,6 +105,7 @@ class Job(t.Generic[T_IN, T_OUT]):
     enqueue_time: float
     data: T_IN
     future: asyncio.Future[T_OUT | Exception]
+    deadline: float
     dispatch_time: float = 0
 
 
@@ -129,6 +130,7 @@ class CorkDispatcher(t.Generic[T_IN, T_OUT]):
         fallback: t.Callable[[], T_OUT],
         get_batch_size: t.Callable[[T_IN], int] = lambda x: x.sample.batch_size,
         batch_dim: tuple[int, int] = (0, 0),
+        clock: t.Callable[[], float] = time.monotonic,
     ) -> None:
         ...
         """
@@ -153,6 +155,7 @@ class CorkDispatcher(t.Generic[T_IN, T_OUT]):
         )  # TODO(bojiang): maxlen
         self.get_batch_size = get_batch_size
         self.batch_dim = batch_dim
+        self._clock = clock
         # at most 1 batch can be processed at the same time
         self._sema = shared_sema if shared_sema else NonBlockSema(1)
 
@@ -175,18 +178,18 @@ class CorkDispatcher(t.Generic[T_IN, T_OUT]):
         callback: t.Callable[
             [t.Sequence[T_IN]], t.Coroutine[None, None, t.Sequence[T_OUT]]
         ],
-    ) -> t.Callable[[T_IN], t.Coroutine[None, None, T_OUT | None]]:
+    ) -> t.Callable[..., t.Coroutine[None, None, T_OUT | None]]:
         if is_async_callable(callback):
             self.callback = callback
         else:
             self.callback = functools.partial(run_in_threadpool, callback)
 
         @functools.wraps(callback)
-        async def _func(data: T_IN) -> T_OUT:
+        async def _func(data: T_IN, *, max_latency_ms: int | None = None) -> T_OUT:
             if self._controller is None:
                 self._controller = self._loop.create_task(self.controller())
             try:
-                r = await self.inbound_call(data)
+                r = await self.inbound_call(data, max_latency_ms=max_latency_ms)
             except asyncio.CancelledError:
                 return self.fallback()
             if isinstance(r, Exception):
@@ -219,7 +222,7 @@ class CorkDispatcher(t.Generic[T_IN, T_OUT]):
                     await self._wake_event.wait_for(self._queue.__len__)
 
                 n = len(self._queue)
-                now = time.time()
+                now = self._clock()
                 # the wait time of the first request
                 w0 = now - self._queue[0].enqueue_time
 
@@ -291,7 +294,7 @@ class CorkDispatcher(t.Generic[T_IN, T_OUT]):
                 n = len(self._queue)
                 dt = self.TICKET_INTERVAL
                 decay = 0.95  # the decay rate of wait time
-                now = time.time()
+                now = self._clock()
                 # the wait time of the first request
                 w0 = now - self._queue[0].enqueue_time
                 # the wait time of the last request
@@ -324,10 +327,20 @@ class CorkDispatcher(t.Generic[T_IN, T_OUT]):
             except Exception:
                 logger.exception("Error processing batch requests")
 
-    async def inbound_call(self, data: T_IN) -> T_OUT | Exception:
-        now = time.time()
+    async def inbound_call(
+        self, data: T_IN, *, max_latency_ms: int | None = None
+    ) -> T_OUT | Exception:
+        now = self._clock()
+        latency = (
+            self.max_latency if max_latency_ms is None else max_latency_ms / 1000.0
+        )
         future: asyncio.Future[T_OUT | Exception] = self._loop.create_future()
-        input_info = Job(now, data, future)
+        input_info = Job(
+            enqueue_time=now,
+            data=data,
+            future=future,
+            deadline=now + latency,
+        )
         self._queue.append(input_info)
         async with self._wake_event:
             self._wake_event.notify_all()
@@ -336,7 +349,7 @@ class CorkDispatcher(t.Generic[T_IN, T_OUT]):
     async def outbound_call(
         self, inputs_info: tuple[Job[T_IN, T_OUT], ...], training: bool = False
     ):
-        _time_start = time.time()
+        _time_start = self._clock()
         _done = False
         batch_size = len(inputs_info)
         logger.debug("Dynamic batching cork released, batch size: %d", batch_size)
@@ -354,7 +367,7 @@ class CorkDispatcher(t.Generic[T_IN, T_OUT]):
                 n=len(inputs_info),
                 # fake wait as 0 for training requests
                 wait=_time_start - inputs_info[0].enqueue_time if not training else 0,
-                duration=time.time() - _time_start,
+                duration=self._clock() - _time_start,
             )
         except Exception as e:  # pylint: disable=broad-except
             for input_info in inputs_info:
