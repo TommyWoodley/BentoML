@@ -273,3 +273,38 @@ def test_popleft_job_updates_candidate_and_expiry_state() -> None:
     assert candidate.job_count == 1
     assert candidate.earliest_deadline == 120
     assert dispatcher._next_expiry == 120
+
+
+def test_split_failure_preserves_queue_and_cached_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = FakeClock()
+    dispatcher = make_dispatcher(
+        clock,
+        max_batch_size=2,
+        get_batch_size=lambda data: data[1],
+    )
+    job = queued_job(
+        dispatcher,
+        data=("A", 4),
+        enqueue_time=90,
+        deadline=105,
+    )
+    dispatcher._append_job(job)
+    candidate = dispatcher._peek_candidate()
+    revision = dispatcher._queue_revision
+
+    def fail_split(
+        _: Job[t.Any, t.Any], __: list[int]
+    ) -> tuple[Job[t.Any, t.Any], Job[t.Any, t.Any]]:
+        raise RuntimeError("split failed")
+
+    monkeypatch.setattr(dispatcher, "split_job", fail_split)
+
+    with pytest.raises(RuntimeError, match="split failed"):
+        dispatcher._take_inputs()
+
+    assert list(dispatcher._queue) == [job]
+    assert dispatcher._queue_revision == revision
+    assert dispatcher._peek_candidate() is candidate
+    assert dispatcher._next_expiry == 105

@@ -540,12 +540,14 @@ class CorkDispatcher(t.Generic[T_IN, T_OUT]):
                 self._untrack_queued_job(job)
                 yield job
             else:
-                job = self._queue.popleft()
-                self._untrack_queued_job(job)
+                job = self._queue[0]
                 chunk_size = num_batches - batch_size  # chunk_size < next_batch_size
                 first_job, second_job = self.split_job(
                     job, [0, chunk_size, next_batch_size]
                 )
+                removed_job = self._queue.popleft()
+                assert removed_job is job
+                self._untrack_queued_job(job)
                 batch_size += chunk_size
                 self._queue.appendleft(second_job)
                 self._track_queued_job(second_job)
