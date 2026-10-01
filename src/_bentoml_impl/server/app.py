@@ -21,6 +21,9 @@ from starlette.staticfiles import StaticFiles
 
 from _bentoml_impl.server.proxy import create_proxy_app
 from _bentoml_sdk import Service
+from _bentoml_sdk.method import DEFAULT_MAX_LATENCY_MS
+from _bentoml_sdk.method import LatencyResolver
+from _bentoml_sdk.method import validate_max_latency_value
 from _bentoml_sdk.service import set_current_service
 from bentoml._internal.container import BentoMLContainer
 from bentoml._internal.marshal.dispatcher import CorkDispatcher
@@ -124,8 +127,14 @@ class ServiceAppFactory(BaseAppFactory):
         for name, method in service.apis.items():
             if not method.batchable:
                 continue
+            configured_latency = method.max_latency_ms
+            dispatcher_latency = (
+                configured_latency
+                if type(configured_latency) is int
+                else DEFAULT_MAX_LATENCY_MS
+            )
             self.dispatchers[name] = CorkDispatcher(
-                max_latency_in_ms=method.max_latency_ms,
+                max_latency_in_ms=dispatcher_latency,
                 max_batch_size=method.max_batch_size,
                 fallback=fallback,
                 get_batch_size=functools.partial(
@@ -666,7 +675,12 @@ class ServiceAppFactory(BaseAppFactory):
         return output
 
     async def batch_infer(
-        self, name: str, input_args: tuple[t.Any, ...], input_kwargs: dict[str, t.Any]
+        self,
+        name: str,
+        input_args: tuple[t.Any, ...],
+        input_kwargs: dict[str, t.Any],
+        *,
+        max_latency_ms: int,
     ) -> t.Any:
         method = self.service.apis[name]
         func = getattr(self._service_instance, name).local
@@ -710,7 +724,7 @@ class ServiceAppFactory(BaseAppFactory):
             value = input_kwargs.pop(arg_names[0])
         return await self.dispatchers[name](
             functools.partial(inner_infer, **input_kwargs)
-        )(value)
+        )(value, max_latency_ms=max_latency_ms)
 
     async def api_endpoint_wrapper(self, name: str, request: Request) -> Response:
         from pydantic import ValidationError
@@ -802,7 +816,19 @@ class ServiceAppFactory(BaseAppFactory):
         original_func = get_original_func(func)
 
         if method.batchable:
-            output = await self.batch_infer(name, call_args, call_kwargs)
+            configured_latency = method.max_latency_ms
+            if type(configured_latency) is int:
+                resolved_latency = configured_latency
+            else:
+                resolver = t.cast(LatencyResolver, configured_latency)
+                resolved_latency = resolver(request)
+            max_latency_ms = validate_max_latency_value(resolved_latency)
+            output = await self.batch_infer(
+                name,
+                call_args,
+                call_kwargs,
+                max_latency_ms=max_latency_ms,
+            )
         elif inspect.iscoroutinefunction(original_func):
             output = await func(*call_args, **call_kwargs)
         elif inspect.isasyncgenfunction(original_func):
