@@ -216,3 +216,60 @@ def test_expire_jobs_removes_only_expired_jobs_and_preserves_fifo() -> None:
     assert not jobs[0].future.done()
     assert not jobs[2].future.done()
     assert dispatcher._next_expiry == 200
+
+
+class CountingDeadline(float):
+    comparisons = 0
+
+    def __lt__(self, other: object) -> bool:
+        type(self).comparisons += 1
+        return super().__lt__(other)
+
+
+def test_take_inputs_does_not_scan_every_remaining_deadline() -> None:
+    clock = FakeClock()
+    dispatcher = make_dispatcher(clock, max_batch_size=1)
+    for index in range(64):
+        dispatcher._append_job(
+            queued_job(
+                dispatcher,
+                data=(str(index), 1),
+                enqueue_time=float(index),
+                deadline=CountingDeadline(200 + index),
+            )
+        )
+
+    CountingDeadline.comparisons = 0
+    taken = dispatcher._take_inputs()
+
+    assert len(taken) == 1
+    assert CountingDeadline.comparisons < 16
+    assert dispatcher._next_expiry == 201
+
+
+def test_popleft_job_updates_candidate_and_expiry_state() -> None:
+    clock = FakeClock()
+    dispatcher = make_dispatcher(clock, max_batch_size=2)
+    first = queued_job(
+        dispatcher,
+        data=("A", 1),
+        enqueue_time=90,
+        deadline=105,
+    )
+    second = queued_job(
+        dispatcher,
+        data=("B", 1),
+        enqueue_time=91,
+        deadline=120,
+    )
+    dispatcher._append_job(first)
+    dispatcher._append_job(second)
+    assert dispatcher._peek_candidate() is not None
+
+    assert dispatcher._popleft_job() is first
+
+    candidate = dispatcher._peek_candidate()
+    assert candidate is not None
+    assert candidate.job_count == 1
+    assert candidate.earliest_deadline == 120
+    assert dispatcher._next_expiry == 120

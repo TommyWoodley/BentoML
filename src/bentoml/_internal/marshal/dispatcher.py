@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import functools
+import heapq
 import logging
 import time
 import typing as t
@@ -164,6 +165,10 @@ class CorkDispatcher(t.Generic[T_IN, T_OUT]):
         )  # TODO(bojiang): maxlen
         self._queue_revision = 0
         self._candidate_cache: tuple[int, CandidateInfo] | None = None
+        self._deadline_heap: list[tuple[float, int]] = []
+        self._active_job_tokens: set[int] = set()
+        self._job_tokens: dict[int, int] = {}
+        self._next_job_token = 0
         self._next_expiry: float | None = None
         self.get_batch_size = get_batch_size
         self.batch_dim = batch_dim
@@ -175,13 +180,48 @@ class CorkDispatcher(t.Generic[T_IN, T_OUT]):
         self._queue_revision += 1
         self._candidate_cache = None
         if recompute_expiry:
-            self._next_expiry = min((job.deadline for job in self._queue), default=None)
+            self._rebuild_deadline_index()
+
+    def _track_queued_job(self, job: Job[T_IN, T_OUT]) -> None:
+        token = self._next_job_token
+        self._next_job_token += 1
+        self._job_tokens[id(job)] = token
+        self._active_job_tokens.add(token)
+        heapq.heappush(self._deadline_heap, (job.deadline, token))
+        if self._next_expiry is None or job.deadline < self._next_expiry:
+            self._next_expiry = job.deadline
+
+    def _untrack_queued_job(self, job: Job[T_IN, T_OUT]) -> None:
+        token = self._job_tokens.pop(id(job))
+        self._active_job_tokens.remove(token)
+
+    def _refresh_next_expiry(self) -> None:
+        while (
+            self._deadline_heap
+            and self._deadline_heap[0][1] not in self._active_job_tokens
+        ):
+            heapq.heappop(self._deadline_heap)
+        self._next_expiry = self._deadline_heap[0][0] if self._deadline_heap else None
+
+    def _rebuild_deadline_index(self) -> None:
+        self._deadline_heap.clear()
+        self._active_job_tokens.clear()
+        self._job_tokens.clear()
+        self._next_expiry = None
+        for job in self._queue:
+            self._track_queued_job(job)
 
     def _append_job(self, job: Job[T_IN, T_OUT]) -> None:
         self._queue.append(job)
         self._invalidate_queue_state(recompute_expiry=False)
-        if self._next_expiry is None or job.deadline < self._next_expiry:
-            self._next_expiry = job.deadline
+        self._track_queued_job(job)
+
+    def _popleft_job(self) -> Job[T_IN, T_OUT]:
+        job = self._queue.popleft()
+        self._untrack_queued_job(job)
+        self._invalidate_queue_state(recompute_expiry=False)
+        self._refresh_next_expiry()
+        return job
 
     def _get_batch_size(self, data: T_IN) -> int:
         try:
@@ -258,7 +298,8 @@ class CorkDispatcher(t.Generic[T_IN, T_OUT]):
     ) -> tuple[Job[T_IN, T_OUT], ...]:
         inputs = tuple(self._get_inputs(num_batches))
         if inputs:
-            self._invalidate_queue_state(recompute_expiry=True)
+            self._invalidate_queue_state(recompute_expiry=False)
+            self._refresh_next_expiry()
         return inputs
 
     def shutdown(self) -> None:
@@ -331,7 +372,7 @@ class CorkDispatcher(t.Generic[T_IN, T_OUT]):
                 # only cancel requests if there are more than enough for training
                 if n > num_required_reqs - req_count and w0 >= self.max_latency:
                     # we're being very conservative and only canceling requests if they have already timed out
-                    self._queue.popleft().future.cancel()
+                    self._popleft_job().future.cancel()
                     continue
                 if training_batch_size > 1:  # only wait if batch_size
                     a = self.optimizer.o_a
@@ -408,11 +449,11 @@ class CorkDispatcher(t.Generic[T_IN, T_OUT]):
                 latency_0 = w0 + a * n + b
 
                 if n > 1 and latency_0 >= self.max_latency:
-                    self._queue.popleft().future.cancel()
+                    self._popleft_job().future.cancel()
                     continue
                 if self._sema.is_locked():
                     if n == 1 and w0 >= self.max_latency:
-                        self._queue.popleft().future.cancel()
+                        self._popleft_job().future.cancel()
                         continue
                     await asyncio.sleep(self.TICKET_INTERVAL)
                     continue
@@ -495,15 +536,19 @@ class CorkDispatcher(t.Generic[T_IN, T_OUT]):
             next_batch_size = self._get_batch_size(self._queue[0].data)
             if batch_size + next_batch_size <= num_batches:
                 batch_size += next_batch_size
-                yield self._queue.popleft()
+                job = self._queue.popleft()
+                self._untrack_queued_job(job)
+                yield job
             else:
                 job = self._queue.popleft()
+                self._untrack_queued_job(job)
                 chunk_size = num_batches - batch_size  # chunk_size < next_batch_size
                 first_job, second_job = self.split_job(
                     job, [0, chunk_size, next_batch_size]
                 )
                 batch_size += chunk_size
                 self._queue.appendleft(second_job)
+                self._track_queued_job(second_job)
                 yield first_job
 
     def split_job(
