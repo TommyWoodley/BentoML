@@ -73,6 +73,30 @@ async def test_inbound_call_uses_constructor_default() -> None:
 
 
 @pytest.mark.asyncio
+async def test_static_latency_does_not_build_dynamic_deadline_index() -> None:
+    clock = FakeClock()
+    dispatcher = CorkDispatcher(
+        max_latency_in_ms=80,
+        max_batch_size=8,
+        fallback=lambda: "fallback",
+        get_batch_size=lambda _: 1,
+        batch_dim=(0, 0),
+        clock=clock,
+    )
+
+    task = asyncio.create_task(dispatcher.inbound_call("request"))
+    await asyncio.sleep(0)
+
+    job = dispatcher._queue[0]
+    assert dispatcher._deadline_heap == []
+    assert dispatcher._job_tokens == {}
+    assert dispatcher._next_expiry == job.deadline
+
+    job.future.set_result("response")
+    assert await task == "response"
+
+
+@pytest.mark.asyncio
 async def test_dispatcher_wrapper_forwards_explicit_latency(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -503,3 +527,35 @@ async def test_static_wrapper_keeps_constructor_default(
         assert await task == "legacy"
     finally:
         dispatcher.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_static_controller_skips_dynamic_candidate_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = FakeClock()
+    dispatcher = make_dispatcher(clock, max_latency_in_ms=40)
+    candidate_scans = 0
+    original_peek_candidate = dispatcher._peek_candidate
+
+    async def skip_training(*_: object) -> None:
+        return None
+
+    def count_candidate_scan(*args: object, **kwargs: object) -> CandidateInfo | None:
+        nonlocal candidate_scans
+        candidate_scans += 1
+        return original_peek_candidate(*args, **kwargs)
+
+    monkeypatch.setattr(dispatcher, "train_optimizer", skip_training)
+    monkeypatch.setattr(dispatcher, "_peek_candidate", count_candidate_scan)
+
+    async def callback(values: t.Sequence[str]) -> t.Sequence[str]:
+        return values
+
+    wrapped = dispatcher(callback)
+    try:
+        assert await asyncio.wait_for(wrapped("request"), timeout=0.1) == "request"
+    finally:
+        dispatcher.shutdown()
+
+    assert candidate_scans == 0

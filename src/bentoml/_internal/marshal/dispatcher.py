@@ -173,6 +173,7 @@ class CorkDispatcher(t.Generic[T_IN, T_OUT]):
         get_batch_size: t.Callable[[T_IN], int] = lambda x: x.sample.batch_size,
         batch_dim: tuple[int, int] = (0, 0),
         clock: t.Callable[[], float] = time.monotonic,
+        dynamic_latency: bool = False,
     ) -> None:
         ...
         """
@@ -183,6 +184,7 @@ class CorkDispatcher(t.Generic[T_IN, T_OUT]):
             * get_batch_size: callable to get batch size from inputs
             * batch_dim: tuple of (input_dim, output_dim) of batch
             * fallback: callable to return fallback result
+            * dynamic_latency: whether requests may have different latency budgets
         raises:
             * all possible exceptions the decorated function has
         """
@@ -197,6 +199,8 @@ class CorkDispatcher(t.Generic[T_IN, T_OUT]):
         )  # TODO(bojiang): maxlen
         self._queue_revision = 0
         self._candidate_cache: tuple[int, CandidateInfo] | None = None
+        self._dynamic_latency = dynamic_latency
+        self._deadline_index_enabled = False
         self._deadline_heap: list[tuple[float, int]] = []
         self._active_job_tokens: set[int] = set()
         self._job_tokens: dict[int, int] = {}
@@ -215,6 +219,10 @@ class CorkDispatcher(t.Generic[T_IN, T_OUT]):
             self._rebuild_deadline_index()
 
     def _track_queued_job(self, job: Job[T_IN, T_OUT]) -> None:
+        if not self._deadline_index_enabled:
+            if self._next_expiry is None:
+                self._next_expiry = job.deadline
+            return
         token = self._next_job_token
         self._next_job_token += 1
         self._job_tokens[id(job)] = token
@@ -224,10 +232,15 @@ class CorkDispatcher(t.Generic[T_IN, T_OUT]):
             self._next_expiry = job.deadline
 
     def _untrack_queued_job(self, job: Job[T_IN, T_OUT]) -> None:
+        if not self._deadline_index_enabled:
+            return
         token = self._job_tokens.pop(id(job))
         self._active_job_tokens.remove(token)
 
     def _refresh_next_expiry(self) -> None:
+        if not self._deadline_index_enabled:
+            self._next_expiry = self._queue[0].deadline if self._queue else None
+            return
         while (
             self._deadline_heap
             and self._deadline_heap[0][1] not in self._active_job_tokens
@@ -236,6 +249,9 @@ class CorkDispatcher(t.Generic[T_IN, T_OUT]):
         self._next_expiry = self._deadline_heap[0][0] if self._deadline_heap else None
 
     def _rebuild_deadline_index(self) -> None:
+        if not self._deadline_index_enabled:
+            self._next_expiry = self._queue[0].deadline if self._queue else None
+            return
         self._deadline_heap.clear()
         self._active_job_tokens.clear()
         self._job_tokens.clear()
@@ -244,6 +260,13 @@ class CorkDispatcher(t.Generic[T_IN, T_OUT]):
             self._track_queued_job(job)
 
     def _append_job(self, job: Job[T_IN, T_OUT]) -> None:
+        if (
+            not self._deadline_index_enabled
+            and self._queue
+            and job.deadline < self._queue[-1].deadline
+        ):
+            self._deadline_index_enabled = True
+            self._rebuild_deadline_index()
         self._queue.append(job)
         self._invalidate_queue_state(recompute_expiry=False)
         self._track_queued_job(job)
@@ -302,6 +325,16 @@ class CorkDispatcher(t.Generic[T_IN, T_OUT]):
     def _expire_jobs(self, now: float) -> int:
         if self._next_expiry is None or now < self._next_expiry:
             return 0
+
+        if not self._deadline_index_enabled:
+            expired: list[Job[T_IN, T_OUT]] = []
+            while self._queue and self._queue[0].deadline <= now:
+                expired.append(self._queue.popleft())
+            self._invalidate_queue_state(recompute_expiry=True)
+            for job in expired:
+                if not job.future.done():
+                    job.future.cancel()
+            return len(expired)
 
         surviving: collections.deque[Job[T_IN, T_OUT]] = collections.deque()
         expired: list[Job[T_IN, T_OUT]] = []
@@ -456,6 +489,39 @@ class CorkDispatcher(t.Generic[T_IN, T_OUT]):
                 if not self._queue:
                     continue
 
+                if not self._dynamic_latency:
+                    n = len(self._queue)
+                    first_job = self._queue[0]
+                    a = self.optimizer.o_a
+                    b = self.optimizer.o_b
+                    predicted_completion = now + a * n + b
+                    if n > 1 and predicted_completion >= first_job.deadline:
+                        expired_job = self._queue.popleft()
+                        self._invalidate_queue_state(recompute_expiry=True)
+                        expired_job.future.cancel()
+                        continue
+                    if self._sema.is_locked():
+                        if n == 1 and now >= first_job.deadline:
+                            expired_job = self._queue.popleft()
+                            self._invalidate_queue_state(recompute_expiry=True)
+                            expired_job.future.cancel()
+                            continue
+                        await asyncio.sleep(self.TICKET_INTERVAL)
+                        continue
+                    newest_wait = now - self._queue[-1].enqueue_time
+                    if (
+                        n < self.max_batch_size
+                        and n * (newest_wait + self.TICKET_INTERVAL + (a or 0))
+                        <= self.optimizer.wait * 0.95
+                    ):
+                        await asyncio.sleep(self.TICKET_INTERVAL)
+                        continue
+                    acquired = self._sema.acquire()
+                    assert acquired
+                    inputs_info = self._take_inputs()
+                    self._loop.create_task(self.outbound_call(inputs_info))
+                    continue
+
                 candidate = self._peek_candidate()
                 assert candidate is not None
                 a = self.optimizer.o_a
@@ -495,6 +561,8 @@ class CorkDispatcher(t.Generic[T_IN, T_OUT]):
         latency = (
             self.max_latency if max_latency_ms is None else max_latency_ms / 1000.0
         )
+        if latency != self.max_latency:
+            self._dynamic_latency = True
         future: asyncio.Future[T_OUT | Exception] = self._loop.create_future()
         input_info = Job(
             enqueue_time=now,

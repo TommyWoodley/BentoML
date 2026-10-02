@@ -141,6 +141,7 @@ class ServiceAppFactory(BaseAppFactory):
                     AutoContainer.get_batch_size, batch_dim=method.batch_dim[0]
                 ),
                 batch_dim=method.batch_dim,
+                dynamic_latency=type(configured_latency) is not int,
             )
 
     @functools.cached_property
