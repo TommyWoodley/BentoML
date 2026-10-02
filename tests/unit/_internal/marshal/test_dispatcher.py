@@ -274,6 +274,36 @@ def test_take_inputs_does_not_scan_every_remaining_deadline() -> None:
     assert dispatcher._next_expiry == 201
 
 
+def test_deadline_heap_does_not_accumulate_dispatched_jobs() -> None:
+    clock = FakeClock()
+    dispatcher = make_dispatcher(clock, max_batch_size=2)
+    pair_count = 128
+
+    for index in range(pair_count):
+        dispatcher._append_job(
+            queued_job(
+                dispatcher,
+                data=(f"long-{index}", 1),
+                enqueue_time=float(index),
+                deadline=10_000 + index,
+            )
+        )
+        dispatcher._append_job(
+            queued_job(
+                dispatcher,
+                data=(f"short-{index}", 1),
+                enqueue_time=float(index),
+                deadline=200 + index,
+            )
+        )
+
+    for _ in range(pair_count - 1):
+        dispatcher._take_inputs()
+
+    assert len(dispatcher._queue) == 2
+    assert len(dispatcher._deadline_heap) <= 2 * len(dispatcher._active_job_tokens)
+
+
 def test_split_failure_preserves_queue_and_cached_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -246,6 +246,9 @@ class CorkDispatcher(t.Generic[T_IN, T_OUT]):
             and self._deadline_heap[0][1] not in self._active_job_tokens
         ):
             heapq.heappop(self._deadline_heap)
+        if len(self._deadline_heap) > 2 * len(self._active_job_tokens):
+            self._rebuild_deadline_index()
+            return
         self._next_expiry = self._deadline_heap[0][0] if self._deadline_heap else None
 
     def _rebuild_deadline_index(self) -> None:
