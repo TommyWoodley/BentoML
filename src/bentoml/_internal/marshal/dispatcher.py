@@ -495,22 +495,14 @@ class CorkDispatcher(t.Generic[T_IN, T_OUT]):
                     a = self.optimizer.o_a
                     b = self.optimizer.o_b
                     predicted_completion = now + a * n + b
-                    if n > 1 and predicted_completion >= first_job.deadline:
-                        expired_job = self._queue.popleft()
-                        self._invalidate_queue_state(recompute_expiry=True)
-                        expired_job.future.cancel()
-                        continue
+                    must_dispatch = predicted_completion >= first_job.deadline
                     if self._sema.is_locked():
-                        if n == 1 and now >= first_job.deadline:
-                            expired_job = self._queue.popleft()
-                            self._invalidate_queue_state(recompute_expiry=True)
-                            expired_job.future.cancel()
-                            continue
                         await asyncio.sleep(self.TICKET_INTERVAL)
                         continue
                     newest_wait = now - self._queue[-1].enqueue_time
                     if (
-                        n < self.max_batch_size
+                        not must_dispatch
+                        and n < self.max_batch_size
                         and n * (newest_wait + self.TICKET_INTERVAL + (a or 0))
                         <= self.optimizer.wait * 0.95
                     ):

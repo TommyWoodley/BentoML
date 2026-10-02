@@ -559,3 +559,49 @@ async def test_static_controller_skips_dynamic_candidate_scan(
         dispatcher.shutdown()
 
     assert candidate_scans == 0
+
+
+@pytest.mark.asyncio
+async def test_static_controller_dispatches_predicted_deadline_miss(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = FakeClock()
+    dispatcher = make_dispatcher(clock, max_latency_in_ms=40)
+    dispatcher.optimizer.o_a = 0.03
+    dispatcher.optimizer.o_b = 0.0
+    dispatched: list[list[str]] = []
+
+    async def skip_training(*_: object) -> None:
+        return None
+
+    async def callback(
+        values: t.Sequence[tuple[str, int]],
+    ) -> t.Sequence[tuple[str, int]]:
+        dispatched.append([name for name, _ in values])
+        return values
+
+    monkeypatch.setattr(dispatcher, "train_optimizer", skip_training)
+    dispatcher.callback = callback
+    jobs = [
+        queued_job(
+            dispatcher,
+            data=(name, 1),
+            enqueue_time=clock(),
+            deadline=clock() + 0.04,
+        )
+        for name in ("A", "B")
+    ]
+    for job in jobs:
+        dispatcher._append_job(job)
+
+    controller = asyncio.create_task(dispatcher.controller())
+    try:
+        results = await asyncio.wait_for(
+            asyncio.gather(*(job.future for job in jobs)), timeout=0.1
+        )
+    finally:
+        controller.cancel()
+        dispatcher.shutdown()
+
+    assert results == [("A", 1), ("B", 1)]
+    assert dispatched == [["A", "B"]]
